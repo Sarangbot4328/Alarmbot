@@ -22,7 +22,7 @@ public final class AlarmRingActivity extends AppCompatActivity {
         public void onReceive(Context context, Intent intent) {
             if (intent == null) return;
             String status = intent.getStringExtra(AlarmRingService.EXTRA_STATUS_TEXT);
-            if (status != null) ringStatus.setText(status);
+            if (status != null && ringStatus != null) ringStatus.setText(status);
         }
     };
 
@@ -40,10 +40,17 @@ public final class AlarmRingActivity extends AppCompatActivity {
         applyExtras(getIntent());
 
         dismiss.setOnClickListener(v -> {
-            Intent stop = new Intent(this, AlarmRingService.class);
-            stop.setAction(AlarmRingService.ACTION_DISMISS);
-            startService(stop);
-            finishAndRemoveTask();
+            try {
+                Intent stop = new Intent(this, AlarmRingService.class);
+                stop.setAction(AlarmRingService.ACTION_DISMISS);
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    startForegroundService(stop);
+                } else {
+                    startService(stop);
+                }
+            } catch (Exception ignored) {
+            }
+            finish();
         });
     }
 

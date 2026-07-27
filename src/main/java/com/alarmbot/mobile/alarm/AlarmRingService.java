@@ -1,6 +1,5 @@
 package com.alarmbot.mobile.alarm;
 
-import android.app.ActivityOptions;
 import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
@@ -9,6 +8,7 @@ import android.app.Service;
 import android.content.Context;
 import android.content.Intent;
 import android.content.pm.ServiceInfo;
+import android.content.res.AssetFileDescriptor;
 import android.media.AudioAttributes;
 import android.media.AudioFocusRequest;
 import android.media.AudioManager;
@@ -37,7 +37,7 @@ public final class AlarmRingService extends Service {
     public static final String EXTRA_ALARM_LABEL = "alarm_label";
     public static final String EXTRA_ALARM_TIME = "alarm_time";
 
-    private static final String CHANNEL_ID = "alarm_ring_channel_v2";
+    private static final String CHANNEL_ID = "alarm_ring_channel_v3";
     private static final int NOTIFICATION_ID = 1001;
     private static final long NEXT_TRACK_DELAY_MS = 5_000L;
     private static final String TAG = "AlarmRingService";
@@ -45,6 +45,7 @@ public final class AlarmRingService extends Service {
     private final Handler handler = new Handler(Looper.getMainLooper());
 
     private MediaPlayer mediaPlayer;
+    private AssetFileDescriptor openAfd;
     private PowerManager.WakeLock wakeLock;
     private AudioManager audioManager;
     private AudioFocusRequest focusRequest;
@@ -56,6 +57,7 @@ public final class AlarmRingService extends Service {
     private int currentTrack;
     private boolean dismissed;
     private boolean waitingForNext;
+    private boolean foregroundStarted;
 
     @Override
     public void onCreate() {
@@ -66,127 +68,137 @@ public final class AlarmRingService extends Service {
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
-        if (intent == null) {
-            stopSelf();
+        try {
+            // Must call startForeground quickly after startForegroundService, or the system kills the app.
+            ensureForegroundStarted("알람");
+
+            if (intent == null) {
+                stopSafely();
+                return START_NOT_STICKY;
+            }
+
+            String action = intent.getAction();
+            if (ACTION_DISMISS.equals(action)) {
+                dismissAndStop();
+                return START_NOT_STICKY;
+            }
+
+            if (!ACTION_START.equals(action)) {
+                stopSafely();
+                return START_NOT_STICKY;
+            }
+
+            alarmId = intent.getStringExtra(AlarmScheduler.EXTRA_ALARM_ID);
+            alarmItem = AlarmStore.getById(this, alarmId);
+            if (alarmItem == null) {
+                stopSafely();
+                return START_NOT_STICKY;
+            }
+
+            dismissed = false;
+            waitingForNext = false;
+            voicePack = VoiceCatalog.get(AppSettings.getVoiceId(this));
+            currentSet = randomSet();
+            currentTrack = 1;
+
+            ensureForegroundStarted(alarmItem.formattedTime());
+            forceMaxAlarmVolume();
+            acquireWakeLock();
+            launchRingActivityWithRetry();
+            playCurrentTrack();
+            AlarmScheduler.rescheduleAfterRing(this, alarmItem);
+            return START_STICKY;
+        } catch (Throwable t) {
+            Log.e(TAG, "onStartCommand failed", t);
+            try {
+                ensureForegroundStarted("알람");
+            } catch (Throwable ignored) {
+            }
+            stopSafely();
             return START_NOT_STICKY;
         }
-
-        String action = intent.getAction();
-        if (ACTION_DISMISS.equals(action)) {
-            dismissAndStop();
-            return START_NOT_STICKY;
-        }
-
-        if (!ACTION_START.equals(action)) {
-            stopSelf();
-            return START_NOT_STICKY;
-        }
-
-        alarmId = intent.getStringExtra(AlarmScheduler.EXTRA_ALARM_ID);
-        alarmItem = AlarmStore.getById(this, alarmId);
-        if (alarmItem == null) {
-            stopSelf();
-            return START_NOT_STICKY;
-        }
-
-        dismissed = false;
-        waitingForNext = false;
-        voicePack = VoiceCatalog.get(AppSettings.getVoiceId(this));
-        currentSet = randomSet();
-        currentTrack = 1;
-
-        forceMaxAlarmVolume();
-        startInForeground();
-        acquireWakeLock();
-        launchRingActivityWithRetry();
-        playCurrentTrack();
-
-        AlarmScheduler.rescheduleAfterRing(this, alarmItem);
-        return START_STICKY;
     }
 
-    private void startInForeground() {
-        PendingIntent fullScreenPi = ringActivityPendingIntent();
-
-        Intent dismissIntent = new Intent(this, AlarmRingService.class);
-        dismissIntent.setAction(ACTION_DISMISS);
-        PendingIntent dismissPi = PendingIntent.getService(
-                this,
-                2,
-                dismissIntent,
-                PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE
-        );
-
-        Notification notification = new NotificationCompat.Builder(this, CHANNEL_ID)
-                .setSmallIcon(R.drawable.ic_app)
-                .setContentTitle(getString(R.string.alarm_ringing))
-                .setContentText(alarmItem.formattedTime()
-                        + (alarmItem.label.isEmpty() ? "" : " · " + alarmItem.label))
-                .setPriority(NotificationCompat.PRIORITY_MAX)
-                .setCategory(NotificationCompat.CATEGORY_ALARM)
-                .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
-                .setOngoing(true)
-                .setAutoCancel(false)
-                .setFullScreenIntent(fullScreenPi, true)
-                .setContentIntent(fullScreenPi)
-                .addAction(0, getString(R.string.dismiss_alarm), dismissPi)
-                .setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
-                .build();
-
+    private void ensureForegroundStarted(String contentText) {
+        Notification notification = buildNotification(contentText);
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK);
         } else {
             startForeground(NOTIFICATION_ID, notification);
         }
-
-        // Re-post so full-screen intent fires even if FGS start alone was insufficient.
+        foregroundStarted = true;
         NotificationManager nm = getSystemService(NotificationManager.class);
         if (nm != null) nm.notify(NOTIFICATION_ID, notification);
     }
 
+    private Notification buildNotification(String contentText) {
+        PendingIntent fullScreenPi = ringActivityPendingIntent();
+        PendingIntent dismissPi = PendingIntent.getService(
+                this,
+                2,
+                new Intent(this, AlarmRingService.class).setAction(ACTION_DISMISS),
+                PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE
+        );
+
+        String title = getString(R.string.alarm_ringing);
+        String text = contentText == null ? title : contentText;
+        if (alarmItem != null && !alarmItem.label.isEmpty()) {
+            text = alarmItem.formattedTime() + " · " + alarmItem.label;
+        } else if (alarmItem != null) {
+            text = alarmItem.formattedTime();
+        }
+
+        return new NotificationCompat.Builder(this, CHANNEL_ID)
+                .setSmallIcon(R.drawable.ic_stat_alarm)
+                .setContentTitle(title)
+                .setContentText(text)
+                .setPriority(NotificationCompat.PRIORITY_MAX)
+                .setCategory(NotificationCompat.CATEGORY_ALARM)
+                .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+                .setOngoing(true)
+                .setAutoCancel(false)
+                .setOnlyAlertOnce(true)
+                .setFullScreenIntent(fullScreenPi, true)
+                .setContentIntent(fullScreenPi)
+                .addAction(0, getString(R.string.dismiss_alarm), dismissPi)
+                .build();
+    }
+
     private PendingIntent ringActivityPendingIntent() {
         Intent fullScreen = ringActivityIntent();
-        int flags = PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE;
-        if (Build.VERSION.SDK_INT >= 34) {
-            ActivityOptions options = ActivityOptions.makeBasic();
-            options.setPendingIntentBackgroundActivityStartMode(
-                    ActivityOptions.MODE_BACKGROUND_ACTIVITY_START_ALLOWED);
-            return PendingIntent.getActivity(
-                    this,
-                    alarmId.hashCode(),
-                    fullScreen,
-                    flags,
-                    options.toBundle()
-            );
-        }
-        return PendingIntent.getActivity(this, alarmId.hashCode(), fullScreen, flags);
+        int requestCode = alarmId != null ? alarmId.hashCode() : 1;
+        return PendingIntent.getActivity(
+                this,
+                requestCode,
+                fullScreen,
+                PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE
+        );
     }
 
     private Intent ringActivityIntent() {
         Intent activity = new Intent(this, AlarmRingActivity.class);
-        activity.putExtra(AlarmScheduler.EXTRA_ALARM_ID, alarmId);
-        activity.putExtra(EXTRA_ALARM_TIME, alarmItem.formattedTime());
-        activity.putExtra(EXTRA_ALARM_LABEL, alarmItem.label);
+        if (alarmId != null) activity.putExtra(AlarmScheduler.EXTRA_ALARM_ID, alarmId);
+        if (alarmItem != null) {
+            activity.putExtra(EXTRA_ALARM_TIME, alarmItem.formattedTime());
+            activity.putExtra(EXTRA_ALARM_LABEL, alarmItem.label);
+        }
         activity.addFlags(
                 Intent.FLAG_ACTIVITY_NEW_TASK
                         | Intent.FLAG_ACTIVITY_CLEAR_TOP
                         | Intent.FLAG_ACTIVITY_SINGLE_TOP
                         | Intent.FLAG_ACTIVITY_REORDER_TO_FRONT
-                        | Intent.FLAG_ACTIVITY_NO_USER_ACTION
         );
         return activity;
     }
 
     private void launchRingActivityWithRetry() {
         launchRingActivity();
-        // Background start can be blocked once; retry a few times while ringing.
-        handler.postDelayed(this::launchRingActivity, 400);
-        handler.postDelayed(this::launchRingActivity, 1200);
-        handler.postDelayed(this::launchRingActivity, 2500);
+        handler.postDelayed(this::launchRingActivity, 500);
+        handler.postDelayed(this::launchRingActivity, 1500);
     }
 
     private void launchRingActivity() {
-        if (dismissed || alarmItem == null) return;
+        if (dismissed) return;
         try {
             startActivity(ringActivityIntent());
         } catch (Exception e) {
@@ -198,15 +210,12 @@ public final class AlarmRingService extends Service {
     private void forceMaxAlarmVolume() {
         if (audioManager == null) return;
         try {
-            previousAlarmVolume = audioManager.getStreamVolume(AudioManager.STREAM_ALARM);
+            if (previousAlarmVolume < 0) {
+                previousAlarmVolume = audioManager.getStreamVolume(AudioManager.STREAM_ALARM);
+            }
             int max = audioManager.getStreamMaxVolume(AudioManager.STREAM_ALARM);
-            audioManager.setStreamVolume(AudioManager.STREAM_ALARM, max, 0);
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                if (audioManager.isStreamMute(AudioManager.STREAM_ALARM)) {
-                    audioManager.adjustStreamVolume(
-                            AudioManager.STREAM_ALARM, AudioManager.ADJUST_UNMUTE, 0);
-                    audioManager.setStreamVolume(AudioManager.STREAM_ALARM, max, 0);
-                }
+            if (max > 0) {
+                audioManager.setStreamVolume(AudioManager.STREAM_ALARM, max, 0);
             }
             requestAlarmAudioFocus();
         } catch (Exception e) {
@@ -216,22 +225,26 @@ public final class AlarmRingService extends Service {
 
     private void requestAlarmAudioFocus() {
         if (audioManager == null) return;
-        AudioAttributes attrs = new AudioAttributes.Builder()
-                .setUsage(AudioAttributes.USAGE_ALARM)
-                .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
-                .build();
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            focusRequest = new AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_EXCLUSIVE)
-                    .setAudioAttributes(attrs)
-                    .setOnAudioFocusChangeListener(focusChange -> { })
+        try {
+            AudioAttributes attrs = new AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_ALARM)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
                     .build();
-            audioManager.requestAudioFocus(focusRequest);
-        } else {
-            audioManager.requestAudioFocus(
-                    focusChange -> { },
-                    AudioManager.STREAM_ALARM,
-                    AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_EXCLUSIVE
-            );
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                focusRequest = new AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT)
+                        .setAudioAttributes(attrs)
+                        .setOnAudioFocusChangeListener(focusChange -> { })
+                        .build();
+                audioManager.requestAudioFocus(focusRequest);
+            } else {
+                audioManager.requestAudioFocus(
+                        focusChange -> { },
+                        AudioManager.STREAM_ALARM,
+                        AudioManager.AUDIOFOCUS_GAIN_TRANSIENT
+                );
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "audio focus failed", e);
         }
     }
 
@@ -241,8 +254,6 @@ public final class AlarmRingService extends Service {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && focusRequest != null) {
                 audioManager.abandonAudioFocusRequest(focusRequest);
                 focusRequest = null;
-            } else {
-                audioManager.abandonAudioFocus(focusChange -> { });
             }
             if (previousAlarmVolume >= 0) {
                 audioManager.setStreamVolume(AudioManager.STREAM_ALARM, previousAlarmVolume, 0);
@@ -254,21 +265,20 @@ public final class AlarmRingService extends Service {
     }
 
     private void playCurrentTrack() {
-        if (dismissed) return;
+        if (dismissed || voicePack == null) return;
         waitingForNext = false;
         releasePlayer();
         forceMaxAlarmVolume();
 
         String path = voicePack.trackAssetPath(currentSet, currentTrack);
-        android.content.res.AssetFileDescriptor afd = null;
         try {
-            afd = getAssets().openFd(path);
+            openAfd = getAssets().openFd(path);
             mediaPlayer = new MediaPlayer();
             mediaPlayer.setAudioAttributes(new AudioAttributes.Builder()
                     .setUsage(AudioAttributes.USAGE_ALARM)
                     .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
                     .build());
-            mediaPlayer.setDataSource(afd.getFileDescriptor(), afd.getStartOffset(), afd.getLength());
+            mediaPlayer.setDataSource(openAfd.getFileDescriptor(), openAfd.getStartOffset(), openAfd.getLength());
             mediaPlayer.setVolume(1f, 1f);
             mediaPlayer.setOnCompletionListener(mp -> onTrackCompleted());
             mediaPlayer.setOnErrorListener((mp, what, extra) -> {
@@ -280,16 +290,10 @@ public final class AlarmRingService extends Service {
             mediaPlayer.start();
             launchRingActivity();
             broadcastStatus();
-        } catch (IOException e) {
+        } catch (Exception e) {
             Log.e(TAG, "Failed to play " + path, e);
+            releasePlayer();
             scheduleNextAfterDelay();
-        } finally {
-            if (afd != null) {
-                try {
-                    afd.close();
-                } catch (IOException ignored) {
-                }
-            }
         }
     }
 
@@ -307,12 +311,11 @@ public final class AlarmRingService extends Service {
         handler.postDelayed(() -> {
             if (!dismissed) playCurrentTrack();
         }, NEXT_TRACK_DELAY_MS);
-        // Keep trying to bring dismiss UI forward while waiting.
         handler.postDelayed(this::launchRingActivity, 500);
     }
 
     private void advanceTrackPointer() {
-        if (currentTrack < voicePack.trackCount) {
+        if (voicePack != null && currentTrack < voicePack.trackCount) {
             currentTrack += 1;
             return;
         }
@@ -321,10 +324,12 @@ public final class AlarmRingService extends Service {
     }
 
     private int randomSet() {
-        return 1 + ThreadLocalRandom.current().nextInt(voicePack.setCount);
+        int count = voicePack != null ? Math.max(1, voicePack.setCount) : 1;
+        return 1 + ThreadLocalRandom.current().nextInt(count);
     }
 
     private void broadcastStatus() {
+        if (alarmItem == null) return;
         String status;
         if (waitingForNext) {
             status = "세트 " + currentSet + " · " + currentTrack + "번 대기 중 (5초 후)";
@@ -334,8 +339,8 @@ public final class AlarmRingService extends Service {
         Intent statusIntent = new Intent(ACTION_STATUS);
         statusIntent.setPackage(getPackageName());
         statusIntent.putExtra(EXTRA_STATUS_TEXT, status);
-        statusIntent.putExtra(EXTRA_ALARM_TIME, alarmItem != null ? alarmItem.formattedTime() : "");
-        statusIntent.putExtra(EXTRA_ALARM_LABEL, alarmItem != null ? alarmItem.label : "");
+        statusIntent.putExtra(EXTRA_ALARM_TIME, alarmItem.formattedTime());
+        statusIntent.putExtra(EXTRA_ALARM_LABEL, alarmItem.label);
         sendBroadcast(statusIntent);
     }
 
@@ -345,34 +350,65 @@ public final class AlarmRingService extends Service {
         releasePlayer();
         restoreAlarmVolume();
         releaseWakeLock();
-        NotificationManager nm = getSystemService(NotificationManager.class);
-        if (nm != null) nm.cancel(NOTIFICATION_ID);
-        stopForeground(STOP_FOREGROUND_REMOVE);
+        stopSafely();
+    }
+
+    private void stopSafely() {
+        try {
+            NotificationManager nm = getSystemService(NotificationManager.class);
+            if (nm != null) nm.cancel(NOTIFICATION_ID);
+            if (foregroundStarted) {
+                stopForeground(STOP_FOREGROUND_REMOVE);
+                foregroundStarted = false;
+            }
+        } catch (Exception ignored) {
+        }
         stopSelf();
     }
 
     private void releasePlayer() {
         if (mediaPlayer != null) {
             try {
+                mediaPlayer.setOnCompletionListener(null);
+                mediaPlayer.setOnErrorListener(null);
                 if (mediaPlayer.isPlaying()) mediaPlayer.stop();
-            } catch (IllegalStateException ignored) {
+            } catch (Exception ignored) {
             }
-            mediaPlayer.release();
+            try {
+                mediaPlayer.release();
+            } catch (Exception ignored) {
+            }
             mediaPlayer = null;
+        }
+        if (openAfd != null) {
+            try {
+                openAfd.close();
+            } catch (IOException ignored) {
+            }
+            openAfd = null;
         }
     }
 
     private void acquireWakeLock() {
-        PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
-        if (pm == null) return;
-        wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "alarmbot:ring");
-        wakeLock.setReferenceCounted(false);
-        wakeLock.acquire(6 * 60 * 60 * 1000L);
+        try {
+            PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
+            if (pm == null) return;
+            if (wakeLock == null) {
+                wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "alarmbot:ring");
+                wakeLock.setReferenceCounted(false);
+            }
+            if (!wakeLock.isHeld()) {
+                wakeLock.acquire(6 * 60 * 60 * 1000L);
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "wake lock failed", e);
+        }
     }
 
     private void releaseWakeLock() {
-        if (wakeLock != null && wakeLock.isHeld()) {
-            wakeLock.release();
+        try {
+            if (wakeLock != null && wakeLock.isHeld()) wakeLock.release();
+        } catch (Exception ignored) {
         }
         wakeLock = null;
     }
