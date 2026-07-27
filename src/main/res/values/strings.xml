@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">알람봇</string>
+    <string name="tab_alarm">알람</string>
+    <string name="tab_todo">할일</string>
+    <string name="tab_settings">설정</string>
+    <string name="switch_to_timer">타이머로 바꾸기</string>
+    <string name="switch_to_alarm">알람으로 바꾸기</string>
+    <string name="add_alarm">알람 추가</string>
+    <string name="edit_alarm">알람 편집</string>
+    <string name="empty_alarms">등록된 알람이 없습니다</string>
+    <string name="todo_placeholder">할일 탭은 다음에 구현합니다</string>
+    <string name="timer_placeholder">타이머는 다음에 구현합니다</string>
+    <string name="voice_section">모닝콜 목소리</string>
+    <string name="voice_iu">21세기대군부인아이유</string>
+    <string name="dismiss_alarm">알람 끄기</string>
+    <string name="alarm_channel_name">알람</string>
+    <string name="alarm_ringing">알람이 울리는 중</string>
+    <string name="save">저장</string>
+    <string name="cancel">취소</string>
+    <string name="label_optional">알람 이름</string>
+    <string name="enabled">사용</string>
+    <string name="delete">삭제</string>
+    <string name="repeat">반복</string>
+    <string name="once">한번만</string>
+    <string name="every_day">매일</string>
+    <string name="weekdays">주중</string>
+    <string name="weekend">주말</string>
+    <string name="day_mon">월</string>
+    <string name="day_tue">화</string>
+    <string name="day_wed">수</string>
+    <string name="day_thu">목</string>
+    <string name="day_fri">금</string>
+    <string name="day_sat">토</string>
+    <string name="day_sun">일</string>
+    <string name="preset_once">한번만</string>
+    <string name="preset_everyday">매일</string>
+    <string name="preset_weekdays">주중</string>
+    <string name="preset_weekend">주말</string>
+    <string name="voice_alarm_set">알람봇에 등록됨: %1$s</string>
+</resources>
