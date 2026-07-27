@@ -26,6 +26,9 @@ public final class SettingsChannelView extends FrameLayout {
         voiceGroup = findViewById(R.id.voice_group);
         version = findViewById(R.id.app_version);
 
+        findViewById(R.id.btn_check_permission)
+                .setOnClickListener(v -> activity.ensureOverlayPermission(true));
+
         voiceGroup.setOnCheckedChangeListener((group, checkedId) -> {
             if (refreshing) return;
             if (checkedId == R.id.voice_iu) {

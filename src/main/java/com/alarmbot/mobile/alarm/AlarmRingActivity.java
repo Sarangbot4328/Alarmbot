@@ -16,6 +16,12 @@ import androidx.appcompat.app.AppCompatActivity;
 import com.alarmbot.mobile.R;
 
 public final class AlarmRingActivity extends AppCompatActivity {
+    private static volatile boolean visible;
+
+    public static boolean isVisible() {
+        return visible;
+    }
+
     private TextView ringStatus;
     private final BroadcastReceiver statusReceiver = new BroadcastReceiver() {
         @Override
@@ -102,6 +108,7 @@ public final class AlarmRingActivity extends AppCompatActivity {
     @Override
     protected void onStart() {
         super.onStart();
+        visible = true;
         IntentFilter filter = new IntentFilter(AlarmRingService.ACTION_STATUS);
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             registerReceiver(statusReceiver, filter, Context.RECEIVER_NOT_EXPORTED);
@@ -112,10 +119,17 @@ public final class AlarmRingActivity extends AppCompatActivity {
 
     @Override
     protected void onStop() {
+        visible = false;
         try {
             unregisterReceiver(statusReceiver);
         } catch (IllegalArgumentException ignored) {
         }
         super.onStop();
+    }
+
+    @Override
+    protected void onDestroy() {
+        visible = false;
+        super.onDestroy();
     }
 }

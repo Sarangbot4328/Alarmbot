@@ -9,6 +9,7 @@ import android.content.pm.PackageManager;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.PowerManager;
 import android.provider.Settings;
 import android.speech.RecognizerIntent;
 import android.widget.Button;
@@ -18,6 +19,7 @@ import android.widget.Toast;
 import androidx.activity.OnBackPressedCallback;
 import androidx.activity.result.ActivityResultLauncher;
 import androidx.activity.result.contract.ActivityResultContracts;
+import androidx.appcompat.app.AlertDialog;
 import androidx.appcompat.app.AppCompatActivity;
 import androidx.core.app.ActivityCompat;
 import androidx.core.content.ContextCompat;
@@ -80,6 +82,7 @@ public final class MainActivity extends AppCompatActivity {
         showAlarm();
         requestNeededPermissions();
         ensureFullScreenIntentPermission();
+        ensureOverlayPermission(false);
         AlarmScheduler.scheduleAll(this);
 
         getOnBackPressedDispatcher().addCallback(this, new OnBackPressedCallback(true) {
@@ -178,6 +181,64 @@ public final class MainActivity extends AppCompatActivity {
             startActivity(intent);
         } catch (Exception ignored) {
         }
+    }
+
+    /**
+     * 백그라운드에서 알람 끄기 화면을 바로 띄우려면 오버레이 권한이 사실상 필수다.
+     * (특히 삼성 기기에서 백그라운드 액티비티 시작이 차단됨)
+     */
+    public void ensureOverlayPermission(boolean fromUser) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return;
+        if (Settings.canDrawOverlays(this)) {
+            ensureBatteryUnrestricted(fromUser);
+            return;
+        }
+        new AlertDialog.Builder(this)
+                .setTitle(R.string.overlay_title)
+                .setMessage(R.string.overlay_message)
+                .setCancelable(false)
+                .setNegativeButton(R.string.overlay_later, (d, w) -> ensureBatteryUnrestricted(fromUser))
+                .setPositiveButton(R.string.overlay_open, (d, w) -> openOverlaySettings())
+                .show();
+    }
+
+    private void openOverlaySettings() {
+        try {
+            Intent intent = new Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION);
+            intent.setData(Uri.parse("package:" + getPackageName()));
+            startActivity(intent);
+        } catch (Exception e) {
+            try {
+                startActivity(new Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION));
+            } catch (Exception ignored) {
+            }
+        }
+    }
+
+    private void ensureBatteryUnrestricted(boolean fromUser) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return;
+        PowerManager pm = getSystemService(PowerManager.class);
+        if (pm == null || pm.isIgnoringBatteryOptimizations(getPackageName())) {
+            if (fromUser) Toast.makeText(this, R.string.permission_ok, Toast.LENGTH_SHORT).show();
+            return;
+        }
+        new AlertDialog.Builder(this)
+                .setTitle(R.string.battery_title)
+                .setMessage(R.string.battery_message)
+                .setNegativeButton(R.string.overlay_later, null)
+                .setPositiveButton(R.string.overlay_open, (d, w) -> {
+                    try {
+                        Intent intent = new Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS);
+                        intent.setData(Uri.parse("package:" + getPackageName()));
+                        startActivity(intent);
+                    } catch (Exception e) {
+                        try {
+                            startActivity(new Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS));
+                        } catch (Exception ignored) {
+                        }
+                    }
+                })
+                .show();
     }
 
     private void ensureFullScreenIntentPermission() {

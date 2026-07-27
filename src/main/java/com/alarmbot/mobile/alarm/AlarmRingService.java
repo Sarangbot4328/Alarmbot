@@ -1,5 +1,6 @@
 package com.alarmbot.mobile.alarm;
 
+import android.app.ActivityOptions;
 import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
@@ -47,6 +48,7 @@ public final class AlarmRingService extends Service {
     private MediaPlayer mediaPlayer;
     private AssetFileDescriptor openAfd;
     private PowerManager.WakeLock wakeLock;
+    private PowerManager.WakeLock screenLock;
     private AudioManager audioManager;
     private AudioFocusRequest focusRequest;
     private int previousAlarmVolume = -1;
@@ -167,12 +169,17 @@ public final class AlarmRingService extends Service {
     private PendingIntent ringActivityPendingIntent() {
         Intent fullScreen = ringActivityIntent();
         int requestCode = alarmId != null ? alarmId.hashCode() : 1;
-        return PendingIntent.getActivity(
-                this,
-                requestCode,
-                fullScreen,
-                PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE
-        );
+        int flags = PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE;
+        if (Build.VERSION.SDK_INT >= 34) {
+            try {
+                ActivityOptions options = ActivityOptions.makeBasic();
+                options.setPendingIntentBackgroundActivityStartMode(
+                        ActivityOptions.MODE_BACKGROUND_ACTIVITY_START_ALLOWED);
+                return PendingIntent.getActivity(this, requestCode, fullScreen, flags, options.toBundle());
+            } catch (Throwable ignored) {
+            }
+        }
+        return PendingIntent.getActivity(this, requestCode, fullScreen, flags);
     }
 
     private Intent ringActivityIntent() {
@@ -195,16 +202,38 @@ public final class AlarmRingService extends Service {
         launchRingActivity();
         handler.postDelayed(this::launchRingActivity, 500);
         handler.postDelayed(this::launchRingActivity, 1500);
+        handler.postDelayed(this::launchRingActivity, 3000);
     }
 
     private void launchRingActivity() {
         if (dismissed) return;
+        if (AlarmRingActivity.isVisible()) {
+            broadcastStatus();
+            return;
+        }
         try {
-            startActivity(ringActivityIntent());
+            startActivity(ringActivityIntent(), backgroundStartOptions());
         } catch (Exception e) {
             Log.w(TAG, "startActivity for ring UI failed", e);
+            try {
+                // Fall back to the notification's full-screen intent.
+                ringActivityPendingIntent().send();
+            } catch (Exception ignored) {
+            }
         }
         broadcastStatus();
+    }
+
+    private android.os.Bundle backgroundStartOptions() {
+        if (Build.VERSION.SDK_INT < 34) return null;
+        try {
+            ActivityOptions options = ActivityOptions.makeBasic();
+            options.setPendingIntentBackgroundActivityStartMode(
+                    ActivityOptions.MODE_BACKGROUND_ACTIVITY_START_ALLOWED);
+            return options.toBundle();
+        } catch (Throwable ignored) {
+            return null;
+        }
     }
 
     private void forceMaxAlarmVolume() {
@@ -389,6 +418,7 @@ public final class AlarmRingService extends Service {
         }
     }
 
+    @SuppressWarnings("deprecation")
     private void acquireWakeLock() {
         try {
             PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
@@ -399,6 +429,19 @@ public final class AlarmRingService extends Service {
             }
             if (!wakeLock.isHeld()) {
                 wakeLock.acquire(6 * 60 * 60 * 1000L);
+            }
+
+            // Screen lock wakes the display so the dismiss UI is actually visible.
+            if (screenLock == null) {
+                screenLock = pm.newWakeLock(
+                        PowerManager.SCREEN_BRIGHT_WAKE_LOCK
+                                | PowerManager.ACQUIRE_CAUSES_WAKEUP
+                                | PowerManager.ON_AFTER_RELEASE,
+                        "alarmbot:screen");
+                screenLock.setReferenceCounted(false);
+            }
+            if (!screenLock.isHeld()) {
+                screenLock.acquire(60_000L);
             }
         } catch (Exception e) {
             Log.w(TAG, "wake lock failed", e);
@@ -411,6 +454,11 @@ public final class AlarmRingService extends Service {
         } catch (Exception ignored) {
         }
         wakeLock = null;
+        try {
+            if (screenLock != null && screenLock.isHeld()) screenLock.release();
+        } catch (Exception ignored) {
+        }
+        screenLock = null;
     }
 
     private void createChannel() {

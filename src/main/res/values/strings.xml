@@ -43,4 +43,13 @@
     <string name="voice_listening">말씀해 주세요</string>
     <string name="voice_parse_fail">알아듣지 못했습니다. 다시 말해 주세요</string>
     <string name="voice_need_mic">마이크 권한이 필요합니다</string>
+    <string name="overlay_title">알람 화면 권한 필요</string>
+    <string name="overlay_message">앱이 백그라운드에 있을 때도 알람 끄기 화면이 바로 뜨려면 \'다른 앱 위에 표시\' 권한이 필요합니다.\n\n다음 화면에서 알람봇을 켜 주세요.</string>
+    <string name="overlay_open">설정 열기</string>
+    <string name="overlay_later">나중에</string>
+    <string name="permission_section">알람 권한</string>
+    <string name="permission_check">알람 화면 권한 확인</string>
+    <string name="permission_ok">권한이 모두 허용되어 있습니다</string>
+    <string name="battery_title">배터리 최적화 해제</string>
+    <string name="battery_message">삼성 등 일부 기기는 배터리 절약 때문에 알람 앱을 강제로 잠재웁니다.\n\n알람봇을 \'제한 없음\'으로 설정해 주세요.</string>
 </resources>
