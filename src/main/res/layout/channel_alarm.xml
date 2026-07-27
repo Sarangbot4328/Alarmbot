@@ -54,6 +54,26 @@
                 android:textAllCaps="false"
                 android:textColor="@android:color/white" />
 
+            <Button
+                android:id="@+id/btn_voice_alarm"
+                style="?android:attr/borderlessButtonStyle"
+                android:layout_width="match_parent"
+                android:layout_height="48dp"
+                android:layout_marginTop="6dp"
+                android:text="@string/voice_add_alarm"
+                android:textAllCaps="false"
+                android:textColor="@color/green_dark"
+                android:textStyle="bold" />
+
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="4dp"
+                android:gravity="center"
+                android:text="@string/voice_add_hint"
+                android:textColor="@color/text_secondary"
+                android:textSize="12sp" />
+
             <TextView
                 android:id="@+id/empty_alarms"
                 android:layout_width="match_parent"

@@ -8,6 +8,7 @@ import android.widget.Button;
 import android.widget.FrameLayout;
 import android.widget.LinearLayout;
 import android.widget.TextView;
+import android.widget.Toast;
 
 import androidx.annotation.NonNull;
 import androidx.appcompat.app.AlertDialog;
@@ -21,6 +22,9 @@ import com.alarmbot.mobile.alarm.AlarmEditActivity;
 import com.alarmbot.mobile.alarm.AlarmItem;
 import com.alarmbot.mobile.alarm.AlarmScheduler;
 import com.alarmbot.mobile.alarm.AlarmStore;
+import com.alarmbot.mobile.alarm.VoiceAlarmParser;
+import com.alarmbot.mobile.settings.AppSettings;
+import com.alarmbot.mobile.voice.VoiceCatalog;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -46,12 +50,14 @@ public final class AlarmChannelView extends FrameLayout {
         emptyView = findViewById(R.id.empty_alarms);
         RecyclerView list = findViewById(R.id.alarm_list);
         Button add = findViewById(R.id.btn_add_alarm);
+        Button voice = findViewById(R.id.btn_voice_alarm);
 
         adapter = new AlarmAdapter();
         list.setLayoutManager(new LinearLayoutManager(activity));
         list.setAdapter(adapter);
 
         add.setOnClickListener(v -> openEditor(null));
+        voice.setOnClickListener(v -> activity.startVoiceAlarm());
         switchMode.setOnClickListener(v -> toggleMode());
         refresh();
     }
@@ -60,6 +66,24 @@ public final class AlarmChannelView extends FrameLayout {
         List<AlarmItem> items = AlarmStore.getAll(activity);
         adapter.submit(items);
         emptyView.setVisibility(items.isEmpty() ? VISIBLE : GONE);
+    }
+
+    public void onVoiceResult(String spoken) {
+        VoiceAlarmParser.Result parsed = VoiceAlarmParser.parse(spoken);
+        if (parsed == null) {
+            Toast.makeText(activity, R.string.voice_parse_fail, Toast.LENGTH_LONG).show();
+            return;
+        }
+        AlarmItem item = AlarmItem.create(parsed.hour, parsed.minute, "", parsed.daysMask);
+        AlarmStore.upsert(activity, item);
+        AlarmScheduler.schedule(activity, item);
+        String voiceName = VoiceCatalog.get(AppSettings.getVoiceId(activity)).displayName;
+        Toast.makeText(
+                activity,
+                item.formattedTime() + " · " + item.repeatLabel(activity) + " · " + voiceName,
+                Toast.LENGTH_LONG
+        ).show();
+        refresh();
     }
 
     private void toggleMode() {

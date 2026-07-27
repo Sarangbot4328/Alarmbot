@@ -1,5 +1,6 @@
 package com.alarmbot.mobile.alarm;
 
+import android.app.ActivityOptions;
 import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
@@ -9,6 +10,8 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.pm.ServiceInfo;
 import android.media.AudioAttributes;
+import android.media.AudioFocusRequest;
+import android.media.AudioManager;
 import android.media.MediaPlayer;
 import android.os.Build;
 import android.os.Handler;
@@ -34,15 +37,18 @@ public final class AlarmRingService extends Service {
     public static final String EXTRA_ALARM_LABEL = "alarm_label";
     public static final String EXTRA_ALARM_TIME = "alarm_time";
 
-    private static final String CHANNEL_ID = "alarm_ring_channel";
+    private static final String CHANNEL_ID = "alarm_ring_channel_v2";
     private static final int NOTIFICATION_ID = 1001;
-    private static final long NEXT_TRACK_DELAY_MS = 60_000L;
+    private static final long NEXT_TRACK_DELAY_MS = 5_000L;
     private static final String TAG = "AlarmRingService";
 
     private final Handler handler = new Handler(Looper.getMainLooper());
 
     private MediaPlayer mediaPlayer;
     private PowerManager.WakeLock wakeLock;
+    private AudioManager audioManager;
+    private AudioFocusRequest focusRequest;
+    private int previousAlarmVolume = -1;
     private String alarmId;
     private AlarmItem alarmItem;
     private VoiceCatalog.VoicePack voicePack;
@@ -54,6 +60,7 @@ public final class AlarmRingService extends Service {
     @Override
     public void onCreate() {
         super.onCreate();
+        audioManager = (AudioManager) getSystemService(Context.AUDIO_SERVICE);
         createChannel();
     }
 
@@ -88,29 +95,18 @@ public final class AlarmRingService extends Service {
         currentSet = randomSet();
         currentTrack = 1;
 
+        forceMaxAlarmVolume();
         startInForeground();
         acquireWakeLock();
-        launchRingActivity();
+        launchRingActivityWithRetry();
         playCurrentTrack();
 
-        // Daily alarms: schedule the next occurrence while this one is ringing.
         AlarmScheduler.rescheduleAfterRing(this, alarmItem);
         return START_STICKY;
     }
 
     private void startInForeground() {
-        Intent fullScreen = new Intent(this, AlarmRingActivity.class);
-        fullScreen.putExtra(AlarmScheduler.EXTRA_ALARM_ID, alarmId);
-        fullScreen.putExtra(EXTRA_ALARM_TIME, alarmItem.formattedTime());
-        fullScreen.putExtra(EXTRA_ALARM_LABEL, alarmItem.label);
-        fullScreen.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-
-        PendingIntent fullScreenPi = PendingIntent.getActivity(
-                this,
-                alarmId.hashCode(),
-                fullScreen,
-                PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE
-        );
+        PendingIntent fullScreenPi = ringActivityPendingIntent();
 
         Intent dismissIntent = new Intent(this, AlarmRingService.class);
         dismissIntent.setAction(ACTION_DISMISS);
@@ -128,10 +124,13 @@ public final class AlarmRingService extends Service {
                         + (alarmItem.label.isEmpty() ? "" : " · " + alarmItem.label))
                 .setPriority(NotificationCompat.PRIORITY_MAX)
                 .setCategory(NotificationCompat.CATEGORY_ALARM)
+                .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
                 .setOngoing(true)
+                .setAutoCancel(false)
                 .setFullScreenIntent(fullScreenPi, true)
                 .setContentIntent(fullScreenPi)
                 .addAction(0, getString(R.string.dismiss_alarm), dismissPi)
+                .setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
                 .build();
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
@@ -139,22 +138,126 @@ public final class AlarmRingService extends Service {
         } else {
             startForeground(NOTIFICATION_ID, notification);
         }
+
+        // Re-post so full-screen intent fires even if FGS start alone was insufficient.
+        NotificationManager nm = getSystemService(NotificationManager.class);
+        if (nm != null) nm.notify(NOTIFICATION_ID, notification);
     }
 
-    private void launchRingActivity() {
+    private PendingIntent ringActivityPendingIntent() {
+        Intent fullScreen = ringActivityIntent();
+        int flags = PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE;
+        if (Build.VERSION.SDK_INT >= 34) {
+            ActivityOptions options = ActivityOptions.makeBasic();
+            options.setPendingIntentBackgroundActivityStartMode(
+                    ActivityOptions.MODE_BACKGROUND_ACTIVITY_START_ALLOWED);
+            return PendingIntent.getActivity(
+                    this,
+                    alarmId.hashCode(),
+                    fullScreen,
+                    flags,
+                    options.toBundle()
+            );
+        }
+        return PendingIntent.getActivity(this, alarmId.hashCode(), fullScreen, flags);
+    }
+
+    private Intent ringActivityIntent() {
         Intent activity = new Intent(this, AlarmRingActivity.class);
         activity.putExtra(AlarmScheduler.EXTRA_ALARM_ID, alarmId);
         activity.putExtra(EXTRA_ALARM_TIME, alarmItem.formattedTime());
         activity.putExtra(EXTRA_ALARM_LABEL, alarmItem.label);
-        activity.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
-        startActivity(activity);
+        activity.addFlags(
+                Intent.FLAG_ACTIVITY_NEW_TASK
+                        | Intent.FLAG_ACTIVITY_CLEAR_TOP
+                        | Intent.FLAG_ACTIVITY_SINGLE_TOP
+                        | Intent.FLAG_ACTIVITY_REORDER_TO_FRONT
+                        | Intent.FLAG_ACTIVITY_NO_USER_ACTION
+        );
+        return activity;
+    }
+
+    private void launchRingActivityWithRetry() {
+        launchRingActivity();
+        // Background start can be blocked once; retry a few times while ringing.
+        handler.postDelayed(this::launchRingActivity, 400);
+        handler.postDelayed(this::launchRingActivity, 1200);
+        handler.postDelayed(this::launchRingActivity, 2500);
+    }
+
+    private void launchRingActivity() {
+        if (dismissed || alarmItem == null) return;
+        try {
+            startActivity(ringActivityIntent());
+        } catch (Exception e) {
+            Log.w(TAG, "startActivity for ring UI failed", e);
+        }
         broadcastStatus();
+    }
+
+    private void forceMaxAlarmVolume() {
+        if (audioManager == null) return;
+        try {
+            previousAlarmVolume = audioManager.getStreamVolume(AudioManager.STREAM_ALARM);
+            int max = audioManager.getStreamMaxVolume(AudioManager.STREAM_ALARM);
+            audioManager.setStreamVolume(AudioManager.STREAM_ALARM, max, 0);
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                if (audioManager.isStreamMute(AudioManager.STREAM_ALARM)) {
+                    audioManager.adjustStreamVolume(
+                            AudioManager.STREAM_ALARM, AudioManager.ADJUST_UNMUTE, 0);
+                    audioManager.setStreamVolume(AudioManager.STREAM_ALARM, max, 0);
+                }
+            }
+            requestAlarmAudioFocus();
+        } catch (Exception e) {
+            Log.w(TAG, "Failed to force max alarm volume", e);
+        }
+    }
+
+    private void requestAlarmAudioFocus() {
+        if (audioManager == null) return;
+        AudioAttributes attrs = new AudioAttributes.Builder()
+                .setUsage(AudioAttributes.USAGE_ALARM)
+                .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                .build();
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            focusRequest = new AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_EXCLUSIVE)
+                    .setAudioAttributes(attrs)
+                    .setOnAudioFocusChangeListener(focusChange -> { })
+                    .build();
+            audioManager.requestAudioFocus(focusRequest);
+        } else {
+            audioManager.requestAudioFocus(
+                    focusChange -> { },
+                    AudioManager.STREAM_ALARM,
+                    AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_EXCLUSIVE
+            );
+        }
+    }
+
+    private void restoreAlarmVolume() {
+        if (audioManager == null) return;
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && focusRequest != null) {
+                audioManager.abandonAudioFocusRequest(focusRequest);
+                focusRequest = null;
+            } else {
+                audioManager.abandonAudioFocus(focusChange -> { });
+            }
+            if (previousAlarmVolume >= 0) {
+                audioManager.setStreamVolume(AudioManager.STREAM_ALARM, previousAlarmVolume, 0);
+                previousAlarmVolume = -1;
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "Failed to restore alarm volume", e);
+        }
     }
 
     private void playCurrentTrack() {
         if (dismissed) return;
         waitingForNext = false;
         releasePlayer();
+        forceMaxAlarmVolume();
 
         String path = voicePack.trackAssetPath(currentSet, currentTrack);
         android.content.res.AssetFileDescriptor afd = null;
@@ -166,6 +269,7 @@ public final class AlarmRingService extends Service {
                     .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
                     .build());
             mediaPlayer.setDataSource(afd.getFileDescriptor(), afd.getStartOffset(), afd.getLength());
+            mediaPlayer.setVolume(1f, 1f);
             mediaPlayer.setOnCompletionListener(mp -> onTrackCompleted());
             mediaPlayer.setOnErrorListener((mp, what, extra) -> {
                 Log.e(TAG, "MediaPlayer error what=" + what + " extra=" + extra);
@@ -174,6 +278,7 @@ public final class AlarmRingService extends Service {
             });
             mediaPlayer.prepare();
             mediaPlayer.start();
+            launchRingActivity();
             broadcastStatus();
         } catch (IOException e) {
             Log.e(TAG, "Failed to play " + path, e);
@@ -202,6 +307,8 @@ public final class AlarmRingService extends Service {
         handler.postDelayed(() -> {
             if (!dismissed) playCurrentTrack();
         }, NEXT_TRACK_DELAY_MS);
+        // Keep trying to bring dismiss UI forward while waiting.
+        handler.postDelayed(this::launchRingActivity, 500);
     }
 
     private void advanceTrackPointer() {
@@ -220,7 +327,7 @@ public final class AlarmRingService extends Service {
     private void broadcastStatus() {
         String status;
         if (waitingForNext) {
-            status = "세트 " + currentSet + " · " + currentTrack + "번 대기 중 (1분 후)";
+            status = "세트 " + currentSet + " · " + currentTrack + "번 대기 중 (5초 후)";
         } else {
             status = "세트 " + currentSet + " · " + currentTrack + "번 재생 중";
         }
@@ -236,7 +343,10 @@ public final class AlarmRingService extends Service {
         dismissed = true;
         handler.removeCallbacksAndMessages(null);
         releasePlayer();
+        restoreAlarmVolume();
         releaseWakeLock();
+        NotificationManager nm = getSystemService(NotificationManager.class);
+        if (nm != null) nm.cancel(NOTIFICATION_ID);
         stopForeground(STOP_FOREGROUND_REMOVE);
         stopSelf();
     }
@@ -276,7 +386,9 @@ public final class AlarmRingService extends Service {
         );
         channel.setDescription(getString(R.string.alarm_ringing));
         channel.setBypassDnd(true);
+        channel.enableVibration(true);
         channel.setLockscreenVisibility(Notification.VISIBILITY_PUBLIC);
+        channel.setSound(null, null);
         NotificationManager nm = getSystemService(NotificationManager.class);
         if (nm != null) nm.createNotificationChannel(channel);
     }
@@ -286,6 +398,7 @@ public final class AlarmRingService extends Service {
         dismissed = true;
         handler.removeCallbacksAndMessages(null);
         releasePlayer();
+        restoreAlarmVolume();
         releaseWakeLock();
         super.onDestroy();
     }

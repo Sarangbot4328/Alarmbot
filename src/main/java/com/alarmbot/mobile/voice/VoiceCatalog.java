@@ -16,7 +16,7 @@ public final class VoiceCatalog {
                 VOICE_IU_DAEGUN,
                 DISPLAY_IU_DAEGUN,
                 "voices/iu_daegun/morningcall",
-                3,
+                5,
                 6
         ));
         PACKS = Collections.unmodifiableMap(map);
